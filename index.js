@@ -1,5 +1,6 @@
 const express = require("express");
 const path = require("path");
+const fs = require("fs");
 const upload = require("./coverUpload");
 const mongoose = require("mongoose");
 const cors = require("cors");
@@ -14,15 +15,51 @@ const app = express();
 // Trust reverse proxy headers in hosted environments (e.g., Render, Railway)
 app.set("trust proxy", 1);
 
-// Allow all in dev; optionally restrict via FRONTEND_URL in production
+// CORS: allow multiple origins (FRONTEND_URLS comma-separated or FRONTEND_URL) and simple wildcard patterns (e.g., https://*.netlify.app)
+function compileOriginPatterns() {
+  const raw = (process.env.FRONTEND_URLS || process.env.FRONTEND_URL || "")
+    .split(",")
+    .map((s) => s.trim())
+    .filter(Boolean);
+  const toMatcher = (s) => {
+    if (s.includes("*")) {
+      // Turn wildcard into regex (escape everything else)
+      const escaped = s
+        .replace(/[-/\\^$+?.()|[\]{}]/g, "\\$&")
+        .replace(/\\\*/g, ".*");
+      return new RegExp(`^${escaped}$`, "i");
+    }
+    return s.replace(/\/$/, "");
+  };
+  const patterns = raw.map(toMatcher);
+  // Sensible defaults if nothing configured: allow localhost dev and Netlify subdomains
+  if (patterns.length === 0) {
+    patterns.push(/^https?:\/\/localhost(?::\d+)?$/i);
+    patterns.push(/^https?:\/\/[^/]+\.netlify\.app$/i);
+  }
+  return patterns;
+}
+
+const originPatterns = compileOriginPatterns();
+
 app.use(
   cors({
-    origin:
-      process.env.NODE_ENV === "production"
-        ? process.env.FRONTEND_URL || "*"
-        : "*",
+    origin: (origin, callback) => {
+      // Allow requests with no origin (same-origin, curl)
+      if (!origin) return callback(null, true);
+      if (process.env.NODE_ENV !== "production") return callback(null, true);
+      const normalized = origin.replace(/\/$/, "");
+      const ok = originPatterns.some((p) =>
+        typeof p === "string" ? p === normalized : p.test(normalized)
+      );
+      return ok
+        ? callback(null, true)
+        : callback(new Error(`Not allowed by CORS: ${origin}`));
+    },
   })
 );
+// Ensure preflight OPTIONS requests are handled
+app.options("*", cors());
 app.use(express.json());
 app.use("/uploads", express.static(path.join(__dirname, "uploads")));
 
@@ -33,8 +70,6 @@ function getPublicBaseUrl(req) {
     /^(https?:\/\/)?(localhost|127\.0\.0\.1|\[?::1\]?)(:|$)/i.test(raw);
   return isLocal ? process.env.FRONTEND_URL || raw : raw;
 }
-
-
 
 mongoose
   .connect(process.env.MONGO_URI, {
@@ -84,10 +119,33 @@ app.post("/api/register", async (req, res) => {
       verificationToken,
     });
     await user.save();
+
+    // Try to send verification email but don't fail registration if mail sending fails
+    const emailConfigured = process.env.EMAIL_USER && process.env.EMAIL_PASS;
     const baseUrl = getPublicBaseUrl(req);
-    await sendVerificationEmail(email, verificationToken, username, baseUrl);
-    res.json({ message: "User registered. Please verify your email." });
+    if (emailConfigured) {
+      sendVerificationEmail(email, verificationToken, username, baseUrl)
+        .then(() => console.log(`[mail] verification email queued to ${email}`))
+        .catch((mailErr) =>
+          console.error("[mail] Failed to send verification email:", mailErr)
+        );
+    } else {
+      console.warn(
+        "[mail] EMAIL_USER/PASS not configured. Skipping verification email."
+      );
+    }
+
+    res.json({
+      message:
+        "User registered. Please verify your email to log in. If you don't receive an email, try again later.",
+    });
   } catch (err) {
+    // Handle duplicate key errors gracefully
+    if (err && err.code === 11000) {
+      return res
+        .status(400)
+        .json({ message: "Username or email already exists" });
+    }
     console.error("Registration error:", err);
     res
       .status(500)
@@ -108,17 +166,32 @@ app.get("/api/verify-email", async (req, res) => {
 
 // Password reset request
 app.post("/api/request-reset", async (req, res) => {
-  const { email } = req.body;
-  const user = await User.findOne({ email });
-  if (!user)
-    return res.status(400).json({ message: "No user with that email" });
-  const resetToken = crypto.randomBytes(32).toString("hex");
-  user.resetToken = resetToken;
-  user.resetTokenExpiry = Date.now() + 1000 * 60 * 30; // 30 min
-  await user.save();
-  const baseUrl = getPublicBaseUrl(req);
-  await sendPasswordResetEmail(email, resetToken, user.username, baseUrl);
-  res.json({ message: "Password reset email sent" });
+  try {
+    const { email } = req.body;
+    const user = await User.findOne({ email });
+    if (!user)
+      return res.status(400).json({ message: "No user with that email" });
+    const resetToken = crypto.randomBytes(32).toString("hex");
+    user.resetToken = resetToken;
+    user.resetTokenExpiry = Date.now() + 1000 * 60 * 30; // 30 min
+    await user.save();
+    const baseUrl = getPublicBaseUrl(req);
+    const emailConfigured = process.env.EMAIL_USER && process.env.EMAIL_PASS;
+    if (!emailConfigured) {
+      console.warn(
+        "[mail] EMAIL_USER/PASS not configured. Cannot send reset email."
+      );
+      return res.status(500).json({
+        message:
+          "Email service not configured. Please try again later or contact support.",
+      });
+    }
+    await sendPasswordResetEmail(email, resetToken, user.username, baseUrl);
+    res.json({ message: "Password reset email sent" });
+  } catch (err) {
+    console.error("Password reset request error:", err);
+    res.status(500).json({ message: "Failed to send reset email" });
+  }
 });
 
 // Password reset
@@ -385,14 +458,24 @@ const PORT = process.env.PORT || 5000;
 // Simple health check
 app.get("/health", (req, res) => res.json({ status: "ok" }));
 
-// In production, serve the React build from the client folder
+// In production, optionally serve the React build if present
 if (process.env.NODE_ENV === "production") {
   const clientBuild = path.join(__dirname, "../client/build");
-  app.use(express.static(clientBuild));
-  // SPA fallback
-  app.get("*", (req, res) => {
-    res.sendFile(path.join(clientBuild, "index.html"));
-  });
+  const indexHtml = path.join(clientBuild, "index.html");
+  const shouldServe =
+    process.env.SERVE_CLIENT === "true" || fs.existsSync(indexHtml);
+  if (shouldServe) {
+    app.use(express.static(clientBuild));
+    // SPA fallback
+    app.get("*", (req, res) => {
+      res.sendFile(indexHtml);
+    });
+  } else {
+    console.log(
+      "[server] Skipping client build serve: not found at",
+      clientBuild
+    );
+  }
 }
 
 app.listen(PORT, () => console.log(`Server running on port ${PORT}`));
