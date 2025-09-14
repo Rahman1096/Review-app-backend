@@ -34,7 +34,7 @@ function getPublicBaseUrl(req) {
   return isLocal ? process.env.FRONTEND_URL || raw : raw;
 }
 
-const mongoose = require("mongoose");
+
 
 mongoose
   .connect(process.env.MONGO_URI, {
