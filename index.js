@@ -458,6 +458,39 @@ const PORT = process.env.PORT || 5000;
 // Simple health check
 app.get("/health", (req, res) => res.json({ status: "ok" }));
 
+// Optional detailed health info for debugging (no secrets exposed)
+// Enable by setting HEALTH_DEBUG=true in environment
+app.get("/health/details", (req, res) => {
+  if (process.env.HEALTH_DEBUG !== "true") {
+    return res.status(404).end();
+  }
+  const stateMap = {
+    0: "disconnected",
+    1: "connected",
+    2: "connecting",
+    3: "disconnecting",
+  };
+  const dbState = mongoose.connection?.readyState ?? 0;
+  const emailConfigured = Boolean(
+    process.env.EMAIL_USER && process.env.EMAIL_PASS
+  );
+  const originsRaw = (process.env.FRONTEND_URLS || process.env.FRONTEND_URL || "")
+    .split(",")
+    .map((s) => s.trim())
+    .filter(Boolean);
+  const patterns = originPatterns.map((p) =>
+    typeof p === "string" ? p : p.toString()
+  );
+  res.json({
+    status: "ok",
+    nodeEnv: process.env.NODE_ENV,
+    db: { state: dbState, stateText: stateMap[dbState] || "unknown" },
+    emailConfigured,
+    jwtSet: Boolean(process.env.JWT_SECRET),
+    cors: { originsRaw, patterns },
+  });
+});
+
 // In production, optionally serve the React build if present
 if (process.env.NODE_ENV === "production") {
   const clientBuild = path.join(__dirname, "../client/build");
